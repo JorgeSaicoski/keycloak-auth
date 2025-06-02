@@ -2,11 +2,14 @@ package keycloakauth
 
 import (
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -54,6 +57,27 @@ func (c *Config) LoadFromEnv() {
 	}
 }
 
+// Validate checks if the configuration is valid
+func (c *Config) Validate() error {
+	// Must have either static key or JWKS endpoint
+	hasStaticKey := c.PublicKeyBase64 != ""
+	hasJWKS := c.KeycloakURL != "" && c.Realm != ""
+
+	if !hasStaticKey && !hasJWKS {
+		return fmt.Errorf("configuration must provide either PublicKeyBase64 or both KeycloakURL and Realm")
+	}
+
+	if c.KeyRefreshInterval <= 0 {
+		return fmt.Errorf("KeyRefreshInterval must be positive")
+	}
+
+	if c.HTTPTimeout <= 0 {
+		return fmt.Errorf("HTTPTimeout must be positive")
+	}
+
+	return nil
+}
+
 // JWKS represents the JSON Web Key Set response from Keycloak
 type JWKS struct {
 	Keys []JWK `json:"keys"`
@@ -66,6 +90,7 @@ type JWK struct {
 	Kid string `json:"kid"`
 	N   string `json:"n"`
 	E   string `json:"e"`
+	Alg string `json:"alg"`
 }
 
 // KeyProvider handles public key retrieval and caching
@@ -74,15 +99,20 @@ type KeyProvider struct {
 	keys      map[string]*rsa.PublicKey
 	lastFetch time.Time
 	client    *http.Client
+	mutex     sync.RWMutex
 }
 
 // NewKeyProvider creates a new key provider
-func NewKeyProvider(config Config) *KeyProvider {
+func NewKeyProvider(config Config) (*KeyProvider, error) {
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
 	return &KeyProvider{
 		config: config,
 		keys:   make(map[string]*rsa.PublicKey),
 		client: &http.Client{Timeout: config.HTTPTimeout},
-	}
+	}, nil
 }
 
 // GetPublicKey retrieves the public key for token validation
@@ -117,7 +147,7 @@ func (kp *KeyProvider) getStaticPublicKey() (*rsa.PublicKey, error) {
 	return publicKey, nil
 }
 
-// getJWKSPublicKey retrieves the public key from JWKS endpoint
+// getJWKSPublicKey retrieves the public key from JWKS endpoint with retry logic
 func (kp *KeyProvider) getJWKSPublicKey(token *jwt.Token) (*rsa.PublicKey, error) {
 	kid, ok := token.Header["kid"].(string)
 	if !ok {
@@ -125,27 +155,36 @@ func (kp *KeyProvider) getJWKSPublicKey(token *jwt.Token) (*rsa.PublicKey, error
 	}
 
 	// Check if we need to refresh keys
-	if time.Since(kp.lastFetch) > kp.config.KeyRefreshInterval {
+	kp.mutex.RLock()
+	needsRefresh := time.Since(kp.lastFetch) > kp.config.KeyRefreshInterval
+	key, keyExists := kp.keys[kid]
+	kp.mutex.RUnlock()
+
+	if needsRefresh || !keyExists {
 		if err := kp.refreshKeys(); err != nil {
-			return nil, fmt.Errorf("failed to refresh keys: %v", err)
+			// If refresh fails but we have cached keys, try to use them
+			kp.mutex.RLock()
+			key, keyExists = kp.keys[kid]
+			kp.mutex.RUnlock()
+
+			if !keyExists {
+				return nil, fmt.Errorf("failed to refresh keys and no cached key found: %v", err)
+			}
+			// Log the error but continue with cached key
+			// In production, you'd want proper logging here
+		} else {
+			// Refresh successful, get the new key
+			kp.mutex.RLock()
+			key, keyExists = kp.keys[kid]
+			kp.mutex.RUnlock()
 		}
 	}
 
-	// Get key from cache
-	if key, exists := kp.keys[kid]; exists {
-		return key, nil
+	if !keyExists {
+		return nil, fmt.Errorf("key with kid %s not found", kid)
 	}
 
-	// Try to refresh keys once more if key not found
-	if err := kp.refreshKeys(); err != nil {
-		return nil, fmt.Errorf("failed to refresh keys: %v", err)
-	}
-
-	if key, exists := kp.keys[kid]; exists {
-		return key, nil
-	}
-
-	return nil, fmt.Errorf("key with kid %s not found", kid)
+	return key, nil
 }
 
 // refreshKeys fetches the latest keys from JWKS endpoint
@@ -175,25 +214,57 @@ func (kp *KeyProvider) refreshKeys() error {
 	// Convert JWKs to RSA public keys
 	newKeys := make(map[string]*rsa.PublicKey)
 	for _, key := range jwks.Keys {
-		if key.Kty == "RSA" && key.Use == "sig" {
+		if key.Kty == "RSA" && (key.Use == "sig" || key.Use == "") {
 			rsaKey, err := parseJWKToRSA(key)
 			if err != nil {
-				continue // Skip invalid keys
+				// Log error but continue processing other keys
+				continue
 			}
 			newKeys[key.Kid] = rsaKey
 		}
 	}
 
+	if len(newKeys) == 0 {
+		return fmt.Errorf("no valid RSA keys found in JWKS response")
+	}
+
+	// Update keys with write lock
+	kp.mutex.Lock()
 	kp.keys = newKeys
 	kp.lastFetch = time.Now()
+	kp.mutex.Unlock()
 
 	return nil
 }
 
 // parseJWKToRSA converts a JWK to an RSA public key
 func parseJWKToRSA(key JWK) (*rsa.PublicKey, error) {
-	// This is a simplified implementation
-	// In production, you'd want to use a proper JWK library
-	// But for now, we'll focus on the base64 env var approach
-	return nil, fmt.Errorf("JWK to RSA conversion not implemented")
+	// Decode the modulus
+	nBytes, err := base64.RawURLEncoding.DecodeString(key.N)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode modulus: %v", err)
+	}
+
+	// Decode the exponent
+	eBytes, err := base64.RawURLEncoding.DecodeString(key.E)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode exponent: %v", err)
+	}
+
+	// Convert bytes to big integers
+	n := new(big.Int).SetBytes(nBytes)
+
+	// Convert exponent bytes to int
+	var e int
+	for _, b := range eBytes {
+		e = e<<8 + int(b)
+	}
+
+	// Create RSA public key
+	rsaKey := &rsa.PublicKey{
+		N: n,
+		E: e,
+	}
+
+	return rsaKey, nil
 }

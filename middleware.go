@@ -48,7 +48,10 @@ type AuthMiddlewareOptions struct {
 
 // AuthMiddleware creates a Gin middleware for Keycloak JWT authentication
 func AuthMiddleware(config Config, options ...AuthMiddlewareOptions) gin.HandlerFunc {
-	keyProvider := NewKeyProvider(config)
+	keyProvider, err := NewKeyProvider(config)
+	if err != nil {
+		panic("Failed to create key provider: " + err.Error())
+	}
 
 	// Set default options
 	opts := AuthMiddlewareOptions{
@@ -100,14 +103,24 @@ func AuthMiddleware(config Config, options ...AuthMiddlewareOptions) gin.Handler
 			return
 		}
 
-		// Parse and validate token
+		// Parse and validate token with retry logic
 		token, err := jwt.Parse(tokenString, keyProvider.GetPublicKey)
 		if err != nil {
-			opts.ErrorHandler(c, &AuthError{
-				Code:    "invalid_token",
-				Message: "Invalid token: " + err.Error(),
-			})
-			return
+			// If parsing fails with JWKS, try refreshing keys once
+			if strings.Contains(err.Error(), "key with kid") && config.KeycloakURL != "" {
+				// Force refresh and try again
+				if refreshErr := keyProvider.refreshKeys(); refreshErr == nil {
+					token, err = jwt.Parse(tokenString, keyProvider.GetPublicKey)
+				}
+			}
+
+			if err != nil {
+				opts.ErrorHandler(c, &AuthError{
+					Code:    "invalid_token",
+					Message: "Invalid token: " + err.Error(),
+				})
+				return
+			}
 		}
 
 		// Extract and validate claims
@@ -155,23 +168,55 @@ func (e *AuthError) Error() string {
 	return e.Message
 }
 
-// defaultClaimsExtractor extracts standard claims
+// defaultClaimsExtractor extracts standard claims with safe type assertions
 func defaultClaimsExtractor(claims jwt.MapClaims) map[string]interface{} {
-	return map[string]interface{}{
-		"sub":                claims["sub"],
-		"preferred_username": claims["preferred_username"],
-		"email":              claims["email"],
-		"name":               claims["name"],
-		"groups":             claims["groups"],
+	result := make(map[string]interface{})
+
+	// Safe extraction with type checking
+	if sub, ok := claims["sub"].(string); ok {
+		result["sub"] = sub
 	}
+
+	if username, ok := claims["preferred_username"].(string); ok {
+		result["preferred_username"] = username
+	}
+
+	if email, ok := claims["email"].(string); ok {
+		result["email"] = email
+	}
+
+	if name, ok := claims["name"].(string); ok {
+		result["name"] = name
+	}
+
+	// Handle groups array safely
+	if groupsInterface, ok := claims["groups"]; ok {
+		if groups, ok := groupsInterface.([]interface{}); ok {
+			var groupStrings []string
+			for _, group := range groups {
+				if groupStr, ok := group.(string); ok {
+					groupStrings = append(groupStrings, groupStr)
+				}
+			}
+			result["groups"] = groupStrings
+		}
+	}
+
+	return result
 }
 
 // defaultErrorHandler handles authentication errors
 func defaultErrorHandler(c *gin.Context, err error) {
 	if authErr, ok := err.(*AuthError); ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": authErr.Message})
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": authErr.Message,
+			"code":  authErr.Code,
+		})
 	} else {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": err.Error(),
+			"code":  "authentication_failed",
+		})
 	}
 	c.Abort()
 }
@@ -179,7 +224,7 @@ func defaultErrorHandler(c *gin.Context, err error) {
 // validateRequiredClaims checks if all required claims are present
 func validateRequiredClaims(claims jwt.MapClaims, required []string) error {
 	for _, claim := range required {
-		if _, exists := claims[claim]; !exists {
+		if value, exists := claims[claim]; !exists || value == nil {
 			return &AuthError{
 				Code:    "missing_required_claim",
 				Message: "Required claim '" + claim + "' not found in token",

@@ -1,6 +1,8 @@
 package keycloakauth
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -61,7 +63,7 @@ func GetToken(c *gin.Context) (*jwt.Token, bool) {
 	return nil, false
 }
 
-// HasRole checks if the user has a specific realm role
+// HasRole checks if the user has a specific realm role with safe type assertions
 func HasRole(c *gin.Context, role string) bool {
 	claims, exists := GetClaims(c)
 	if !exists {
@@ -73,21 +75,31 @@ func HasRole(c *gin.Context, role string) bool {
 		return false
 	}
 
-	roles, ok := realmAccess["roles"].([]interface{})
+	rolesInterface, ok := realmAccess["roles"]
 	if !ok {
 		return false
 	}
 
-	for _, r := range roles {
-		if roleStr, ok := r.(string); ok && roleStr == role {
-			return true
+	// Handle both []interface{} and []string
+	switch roles := rolesInterface.(type) {
+	case []interface{}:
+		for _, r := range roles {
+			if roleStr, ok := r.(string); ok && roleStr == role {
+				return true
+			}
+		}
+	case []string:
+		for _, r := range roles {
+			if r == role {
+				return true
+			}
 		}
 	}
 
 	return false
 }
 
-// HasClientRole checks if the user has a specific client role
+// HasClientRole checks if the user has a specific client role with safe type assertions
 func HasClientRole(c *gin.Context, client, role string) bool {
 	claims, exists := GetClaims(c)
 	if !exists {
@@ -104,14 +116,24 @@ func HasClientRole(c *gin.Context, client, role string) bool {
 		return false
 	}
 
-	roles, ok := clientAccess["roles"].([]interface{})
+	rolesInterface, ok := clientAccess["roles"]
 	if !ok {
 		return false
 	}
 
-	for _, r := range roles {
-		if roleStr, ok := r.(string); ok && roleStr == role {
-			return true
+	// Handle both []interface{} and []string
+	switch roles := rolesInterface.(type) {
+	case []interface{}:
+		for _, r := range roles {
+			if roleStr, ok := r.(string); ok && roleStr == role {
+				return true
+			}
+		}
+	case []string:
+		for _, r := range roles {
+			if r == role {
+				return true
+			}
 		}
 	}
 
@@ -146,33 +168,59 @@ func IsEmailVerified(c *gin.Context) bool {
 	return false
 }
 
-// GetUserGroups extracts the user groups from claims
+// GetUserGroups extracts the user groups from claims with safe type assertions
 func GetUserGroups(c *gin.Context) ([]string, bool) {
 	claims, exists := GetClaims(c)
 	if !exists {
 		return nil, false
 	}
 
-	groups, ok := claims["groups"].([]interface{})
+	groupsInterface, ok := claims["groups"]
 	if !ok {
 		return nil, false
 	}
 
 	var userGroups []string
-	for _, group := range groups {
-		if groupStr, ok := group.(string); ok {
-			userGroups = append(userGroups, groupStr)
+
+	// Handle both []interface{} and []string
+	switch groups := groupsInterface.(type) {
+	case []interface{}:
+		for _, group := range groups {
+			if groupStr, ok := group.(string); ok {
+				userGroups = append(userGroups, groupStr)
+			}
 		}
+	case []string:
+		userGroups = groups
+	default:
+		return nil, false
 	}
 
 	return userGroups, len(userGroups) > 0
+}
+
+// GetUserAttribute extracts a custom user attribute from claims
+func GetUserAttribute(c *gin.Context, attribute string) (interface{}, bool) {
+	claims, exists := GetClaims(c)
+	if !exists {
+		return nil, false
+	}
+
+	if value, exists := claims[attribute]; exists {
+		return value, true
+	}
+
+	return nil, false
 }
 
 // RequireRole creates a middleware that requires a specific realm role
 func RequireRole(role string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !HasRole(c, role) {
-			c.JSON(403, gin.H{"error": "Insufficient privileges: missing role " + role})
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "Insufficient privileges: missing role " + role,
+				"code":  "missing_role",
+			})
 			c.Abort()
 			return
 		}
@@ -184,7 +232,10 @@ func RequireRole(role string) gin.HandlerFunc {
 func RequireClientRole(client, role string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !HasClientRole(c, client, role) {
-			c.JSON(403, gin.H{"error": "Insufficient privileges: missing client role " + client + ":" + role})
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "Insufficient privileges: missing client role " + client + ":" + role,
+				"code":  "missing_client_role",
+			})
 			c.Abort()
 			return
 		}
@@ -196,9 +247,47 @@ func RequireClientRole(client, role string) gin.HandlerFunc {
 func RequireEmailVerified() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !IsEmailVerified(c) {
-			c.JSON(403, gin.H{"error": "Email verification required"})
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "Email verification required",
+				"code":  "email_not_verified",
+			})
 			c.Abort()
 			return
+		}
+		c.Next()
+	}
+}
+
+// RequireAnyRole creates a middleware that requires at least one of the specified roles
+func RequireAnyRole(roles ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		for _, role := range roles {
+			if HasRole(c, role) {
+				c.Next()
+				return
+			}
+		}
+
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "Insufficient privileges: missing any of required roles",
+			"code":  "missing_any_role",
+		})
+		c.Abort()
+	}
+}
+
+// RequireAllRoles creates a middleware that requires all specified roles
+func RequireAllRoles(roles ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		for _, role := range roles {
+			if !HasRole(c, role) {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error": "Insufficient privileges: missing role " + role,
+					"code":  "missing_required_role",
+				})
+				c.Abort()
+				return
+			}
 		}
 		c.Next()
 	}
